@@ -1,0 +1,235 @@
+#!/bin/bash
+# macOS account-backed interactive shells. Compatible with Bash 3.2.
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 077
+
+die() { printf 'agent-user: %s\n' "$*" >&2; exit 1; }
+usage() { printf 'Usage: agent-user NAME\n       agent-user --delete [--force] NAME\n'; }
+
+action=enter
+force=false
+name=
+for argument in "$@"; do
+    case "$argument" in
+        -h|--help) usage; exit 0 ;;
+        --delete) action=delete ;;
+        --force) force=true ;;
+        *) [[ -z "$name" ]] || { usage >&2; exit 2; }; name=$argument ;;
+    esac
+done
+[[ -n "$name" ]] || { usage >&2; exit 2; }
+[[ "$force" == false || "$action" == delete ]] || die '--force requires --delete.'
+[[ "$name" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || die 'Use 1–31 lowercase letters, digits, underscores or hyphens; start with a letter.'
+[[ "$name" != root ]] || die 'The root account is protected.'
+[[ $(uname -s) == Darwin ]] || die 'macOS is required.'
+[[ -t 0 && -t 1 ]] || die 'An interactive terminal is required.'
+
+if [[ $EUID != 0 ]]; then
+    script_dir=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    args=("$name")
+    [[ "$action" != delete ]] || args=(--delete "$name")
+    [[ "$force" == false ]] || args+=(--force)
+    exec /usr/bin/sudo -- /bin/bash "$script_dir/$(basename -- "${BASH_SOURCE[0]}")" "${args[@]}"
+fi
+
+# sudo supplies this identity; never derive ownership from USER or HOME.
+[[ ${SUDO_UID:-} =~ ^[0-9]+$ && ${SUDO_UID:-0} != 0 ]] || die 'Run from your normal account, not a root shell.'
+owner=$SUDO_UID
+[[ $(id -un "$owner") != "$name" ]] || die 'Your own account is protected.'
+state=/var/db/agent-user
+home=/Users/$name
+record=/Users/$name
+[[ ! -L "$state" ]] || die 'State directory must not be a symlink.'
+if [[ ! -e "$state" ]]; then mkdir -m 700 "$state"; fi
+[[ $(stat -f '%u:%Lp' "$state") == 0:700 && -d "$state" ]] || die 'State directory must be root-owned with mode 700.'
+mkdir "$state/lock" 2>/dev/null || die "Another operation is active, or a stale lock exists: $state/lock"
+trap 'rmdir "$state/lock"' EXIT
+meta=$state/$name
+
+attribute() { dscl . -read "$record" "$1" | sed -n 's/^[^:]*: //p'; }
+exists() { dscl . -read "$record" >/dev/null 2>&1; }
+check_attribute() {
+    local actual
+    actual=$(attribute "$1") || die "Cannot read $1 for $name."
+    [[ "$actual" == "$2" ]] || die "$name $1 mismatch: recorded '$2', actual '$actual'. Refusing recovery."
+}
+set_attribute() {
+    local output
+    if output=$(dscl . -create "$record" "$@" 2>&1); then return; fi
+    printf '%s\n' "$output" >&2
+    if [[ "$output" == *eDSPermissionError* ]]; then
+        die "macOS denied setting $1 for $name despite sudo. Try from Terminal.app and allow its administration prompt if shown. Creation state retained; rerun the same command after resolving permissions."
+    fi
+    die "Failed setting $1 for $name; creation state retained."
+}
+verify() {
+    [[ -f "$meta" && ! -L "$meta" ]] || die 'Account is not managed by agent-user.'
+    IFS=' ' read -r saved_owner uid uuid phase < "$meta"
+    [[ "$saved_owner" == "$owner" ]] || die 'Account belongs to another creator.'
+    [[ "$phase" == ready ]] || die "Incomplete operation; administrator recovery required. See $meta"
+    [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 501 && "$uid" != "$owner" ]] || die 'Invalid managed UID.'
+    exists || die 'Managed account is missing; administrator recovery required.'
+    [[ $(attribute UniqueID) == "$uid" && $(attribute GeneratedUID) == "$uuid" ]] || die 'Account identity changed.'
+    [[ $(attribute NFSHomeDirectory) == "$home" ]] || die 'Account home changed.'
+    [[ -d "$home" && ! -L "$home" && $(stat -f %u "$home") == "$uid" ]] || die 'Home is missing, symlinked, or has unexpected ownership.'
+    [[ $(id -u "$name") == "$uid" ]] || die 'Account name resolves to another identity.'
+    if id -Gn "$name" | tr ' ' '\n' | grep -qx admin; then die 'Managed account has administrator privileges.'; fi
+}
+
+as_user() {
+    /usr/bin/sudo -u "#$uid" -H -- /usr/bin/env -i \
+        HOME="$home" USER="$name" LOGNAME="$name" SHELL=/bin/zsh \
+        PATH=/usr/bin:/bin:/usr/sbin:/sbin "$@"
+}
+
+prepare_keychain() {
+    # Never trace secrets, even if the caller started this script with bash -x.
+    set +x
+    local keychain password_file password temporary operation directory probe value cleanup
+    keychain=$home/Library/Keychains/agent-user.keychain-db
+    password_file=$state/$name.keychain-password
+    for directory in "$home/Library" "$home/Library/Keychains"; do
+        [[ ! -L "$directory" ]] || die "Keychain directory is symlinked: $directory"
+    done
+    [[ ! -L "$keychain" && ! -L "$password_file" ]] || die 'Managed keychain or password file is symlinked.'
+    if [[ ! -e "$password_file" ]]; then
+        [[ ! -e "$keychain" ]] || die 'Managed keychain exists without its password; refusing to replace it.'
+        password=$(/usr/bin/openssl rand -hex 32)
+        temporary=$(mktemp "$state/.keychain-password.XXXXXX")
+        printf '%s\n' "$password" > "$temporary"
+        chmod 600 "$temporary"
+        mv -- "$temporary" "$password_file"
+    fi
+    [[ -f "$password_file" && $(stat -f '%u:%Lp' "$password_file") == 0:600 ]] || die 'Keychain password file must be root-owned with mode 600.'
+    IFS= read -r password < "$password_file"
+    [[ "$password" =~ ^[[:xdigit:]]{64}$ ]] || die 'Invalid managed keychain password file; refusing to replace it.'
+    as_user /bin/mkdir -p "$home/Library/Keychains"
+    if [[ ! -e "$keychain" ]]; then
+        operation=create-keychain
+    else
+        [[ -f "$keychain" ]] || die 'Managed keychain is not a regular file.'
+        operation=unlock-keychain
+    fi
+    # One command per security process preserves its exit status. The secret is
+    # pipe input, never an OS argument, exported variable, or on-disk command.
+    if ! printf '%s -p %s "%s"\n' "$operation" "$password" "$keychain" |
+        as_user /usr/bin/security -i >/dev/null 2>&1; then
+        die "Could not $operation for $name; keychain and password retained."
+    fi
+    # Creation unlocks the new keychain. Disable idle/sleep locking for tmux;
+    # reboot/manual locking still requires the unlock performed on each entry.
+    unset password
+    as_user /usr/bin/security set-keychain-settings "$keychain"
+    as_user /usr/bin/security default-keychain -d user -s "$keychain"
+    # A locked legacy login keychain must not intercept credential lookups.
+    as_user /usr/bin/security list-keychains -d user -s "$keychain"
+    probe=agent-user-check.$(/usr/bin/uuidgen)
+    # Deliberately omit a keychain path for write/read: test the default routing
+    # applications use, not merely access to a named database.
+    as_user /usr/bin/security add-generic-password -a "$name" -s "$probe" -w probe \
+        || die 'Managed default keychain is not writable; shell entry stopped.'
+    if ! value=$(as_user /usr/bin/security find-generic-password -a "$name" -s "$probe" -w); then
+        cleanup=$(as_user /usr/bin/security delete-generic-password -a "$name" -s "$probe" "$keychain" 2>&1) \
+            || printf '%s\n' "$cleanup" >&2
+        die 'Managed keychain credential could not be read; shell entry stopped.'
+    fi
+    if ! cleanup=$(as_user /usr/bin/security delete-generic-password -a "$name" -s "$probe" "$keychain" 2>&1); then
+        printf '%s\n' "$cleanup" >&2
+        die 'Could not remove the temporary keychain check item.'
+    fi
+    [[ "$value" == probe ]] || die 'Managed keychain credential check returned unexpected data.'
+}
+
+# Account lifecycle.
+if [[ "$action" == delete ]]; then
+    verify
+    printf 'Delete account %s and all contents of %s?\nType %s to confirm: ' "$name" "$home" "$name" > /dev/tty
+    IFS= read -r answer < /dev/tty || die 'Confirmation cancelled.'
+    [[ "$answer" == "$name" ]] || die 'Deletion cancelled.'
+    verify
+    if [[ "$force" == false ]]; then
+        if pgrep -u "$uid" >/dev/null; then
+            die 'Account has running processes. Stop them first or use --delete --force.'
+        else
+            [[ $? == 1 ]] || die 'Could not check running processes.'
+        fi
+    fi
+    # Delete the local record directly; sysadminctl -keepHome is unavailable
+    # on some macOS systems. Home removal remains a separate guarded operation.
+    dscl . -delete "$record" || die 'Account removal failed; home and metadata retained.'
+    remaining_users=$(dscl . -list /Users) || die 'Cannot verify account removal; home and metadata retained.'
+    if printf '%s\n' "$remaining_users" | grep -Fxq "$name"; then
+        die 'Account still exists; home and metadata retained.'
+    fi
+    [[ ! -L "$home" && $(stat -f %u "$home") == "$uid" ]] || die 'Home changed during deletion; retained for administrator recovery.'
+    /bin/rm -rf -- "$home"
+    [[ ! -e "$home" && ! -L "$home" ]] || die 'Home removal failed; metadata retained.'
+    rm -f -- "$state/$name.keychain-password"
+    rm -- "$meta"
+    printf 'Deleted %s and %s.\n' "$name" "$home"
+    exit 0
+fi
+
+creating=false
+if [[ ! -e "$meta" ]]; then
+    if id "$name" >/dev/null 2>&1 || exists; then die 'Existing account is not managed by agent-user.'; fi
+    [[ ! -e "$home" && ! -L "$home" ]] || die 'Home path already exists.'
+    # Query the search node as well as local records to avoid directory UID collisions.
+    used=$(dscl /Search -list /Users UniqueID)
+    uid=501
+    while printf '%s\n' "$used" | awk '{print $NF}' | grep -qx "$uid"; do uid=$((uid + 1)); done
+    printf '%s %s pending creating\n' "$owner" "$uid" > "$meta"
+    dscl . -create "$record"
+    # Directory Services supplies the account UUID. Never replace its identity.
+    uuid=$(attribute GeneratedUID)
+    [[ "$uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || die 'New account has no valid GeneratedUID; administrator recovery required.'
+    printf '%s %s %s creating\n' "$owner" "$uid" "$uuid" > "$meta"
+    set_attribute UniqueID "$uid"
+    set_attribute PrimaryGroupID 20
+    creating=true
+else
+    [[ -f "$meta" && ! -L "$meta" ]] || die 'Invalid management record.'
+    IFS=' ' read -r saved_owner uid uuid phase < "$meta"
+    if [[ "$phase" == creating ]]; then
+        [[ "$saved_owner" == "$owner" ]] || die 'Account belongs to another creator.'
+        [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 501 && "$uid" != "$owner" ]] || die 'Invalid managed UID.'
+        [[ -n "$uuid" ]] || die 'Missing managed UUID.'
+        exists || die 'Partial account is missing; administrator recovery required.'
+        check_attribute UniqueID "$uid"
+        check_attribute GeneratedUID "$uuid"
+        check_attribute PrimaryGroupID 20
+        [[ $(id -u "$name") == "$uid" ]] || die 'Account name resolves to another UID; refusing recovery.'
+        if id -Gn "$name" | tr ' ' '\n' | grep -qx admin; then die 'Partial account has administrator privileges.'; fi
+        if [[ -e "$home" || -L "$home" ]]; then
+            [[ -d "$home" && ! -L "$home" && $(stat -f %u "$home") == "$uid" ]] || die 'Conflicting home; refusing recovery.'
+        fi
+        printf 'Resuming creation of %s.\n' "$name"
+        creating=true
+    fi
+fi
+if [[ "$creating" == true ]]; then
+    set_attribute NFSHomeDirectory "$home"
+    set_attribute UserShell /bin/zsh
+    set_attribute RealName "agent-user: $name"
+    set_attribute Password '*'
+    set_attribute IsHidden 1
+    if [[ ! -e "$home" ]]; then
+        mkdir -m 700 "$home"
+        chown "$uid:20" "$home"
+    fi
+    chmod 700 "$home"
+    printf '%s %s %s ready\n' "$owner" "$uid" "$uuid" > "$meta"
+    printf 'Created %s (%s).\n' "$name" "$home"
+fi
+verify
+prepare_keychain
+cd "$home"
+rmdir "$state/lock"
+trap - EXIT
+printf 'Entering %s. Use exit to return.\n' "$name"
+exec /usr/bin/sudo -u "#$uid" -H -- /usr/bin/env -i \
+    HOME="$home" USER="$name" LOGNAME="$name" SHELL=/bin/zsh \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM="${TERM:-xterm-256color}" \
+    LANG="${LANG:-en_US.UTF-8}" /bin/zsh -l
