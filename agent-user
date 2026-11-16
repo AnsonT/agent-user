@@ -98,7 +98,7 @@ prepare_keychain() {
     local keychain password_file password temporary operation directory probe value cleanup
     keychain=$home/Library/Keychains/agent-user.keychain-db
     password_file=$state/$name.keychain-password
-    for directory in "$home/Library" "$home/Library/Keychains"; do
+    for directory in "$home/Library" "$home/Library/Keychains" "$home/Library/Preferences"; do
         [[ ! -L "$directory" ]] || die "Keychain directory is symlinked: $directory"
     done
     [[ ! -L "$keychain" && ! -L "$password_file" ]] || die 'Managed keychain or password file is symlinked.'
@@ -113,7 +113,8 @@ prepare_keychain() {
     [[ -f "$password_file" && $(stat -f '%u:%Lp' "$password_file") == 0:600 ]] || die 'Keychain password file must be root-owned with mode 600.'
     IFS= read -r password < "$password_file"
     [[ "$password" =~ ^[[:xdigit:]]{64}$ ]] || die 'Invalid managed keychain password file; refusing to replace it.'
-    as_user /bin/mkdir -p "$home/Library/Keychains"
+    # Security silently fails to persist defaults if Preferences is absent.
+    as_user /bin/mkdir -p "$home/Library/Keychains" "$home/Library/Preferences"
     if [[ ! -e "$keychain" ]]; then
         operation=create-keychain
     else
@@ -126,13 +127,28 @@ prepare_keychain() {
         as_user /usr/bin/security -i >/dev/null 2>&1; then
         die "Could not $operation for $name; keychain and password retained."
     fi
-    # Creation unlocks the new keychain. Disable idle/sleep locking for tmux;
+    # Explicitly unlock newly created databases too, before any credential write.
+    if [[ "$operation" == create-keychain ]]; then
+        if ! printf 'unlock-keychain -p %s "%s"\n' "$password" "$keychain" |
+            as_user /usr/bin/security -i >/dev/null 2>&1; then
+            die "Could not unlock newly created keychain for $name; keychain and password retained."
+        fi
+    fi
+    # Disable idle/sleep locking for tmux;
     # reboot/manual locking still requires the unlock performed on each entry.
     unset password
     as_user /usr/bin/security set-keychain-settings "$keychain"
-    as_user /usr/bin/security default-keychain -d user -s "$keychain"
+    # Configure the current default used by SecKeychainCopyDefault, rather
+    # than only the explicit user preference domain (a different Security API).
+    as_user /usr/bin/security default-keychain -s "$keychain"
     # A locked legacy login keychain must not intercept credential lookups.
-    as_user /usr/bin/security list-keychains -d user -s "$keychain"
+    as_user /usr/bin/security list-keychains -s "$keychain"
+    value=$(as_user /usr/bin/security default-keychain) \
+        || die 'No default keychain resolves in the target-user session.'
+    value=${value#*\"}
+    value=${value%\"*}
+    [[ "$value" == "$keychain" ]] \
+        || die "Default keychain resolves to '$value', not '$keychain'; refusing credential writes."
     probe=agent-user-check.$(/usr/bin/uuidgen)
     # Deliberately omit a keychain path for write/read: test the default routing
     # applications use, not merely access to a named database.

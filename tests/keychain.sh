@@ -31,11 +31,23 @@ as_user() {
             printf '%s\n' "$secret" > "$path"
         else
             [[ "$secret" == "$(cat "$path")" ]] || return 93
+            [[ ${fail_unlock:-false} == false ]] || return 97
+            touch "$fixture/unlocked"
         fi
     else
         printf '%s\n' "$1" >> "$fixture/calls"
         case "$1" in
+            default-keychain)
+                if [[ $# == 1 ]]; then
+                    printf '    "%s"\n' "${default_override:-$home/Library/Keychains/agent-user.keychain-db}"
+                else
+                    [[ $2 == -s ]] || return 99
+                    [[ -d "$home/Library/Preferences" ]] || return 100
+                fi
+                ;;
+            list-keychains) [[ $2 == -s ]] || return 99 ;;
             add-generic-password)
+                [[ -f "$fixture/unlocked" ]] || return 98
                 grep -q '^list-keychains$' "$fixture/calls" || return 94
                 [[ ${fail_write:-false} == false ]] || return 95
                 ;;
@@ -51,6 +63,7 @@ reset_fixture() {
     home=$fixture/home; state=$fixture/state; name=testuser; uid=999
     mkdir -p "$home" "$state"
     : > "$fixture/calls"
+    rm -f "$fixture/unlocked"
 }
 expect_failure() {
     local message=$1 output
@@ -65,8 +78,13 @@ original=$(cat "$password_file")
 prepare_keychain
 [[ $(cat "$password_file") == "$original" ]]
 [[ $(grep -c '^create-keychain$' "$fixture/calls") == 1 ]]
-[[ $(grep -c '^unlock-keychain$' "$fixture/calls") == 1 ]]
+[[ $(grep -c '^unlock-keychain$' "$fixture/calls") == 2 ]]
 ! grep -q "$original" "$fixture/calls"
+default_override=/wrong/keychain
+: > "$fixture/calls"
+expect_failure 'Default keychain resolves to'
+! grep -q '^add-generic-password$' "$fixture/calls"
+unset default_override
 fail_write=true
 expect_failure 'not writable'
 fail_write=false
@@ -82,7 +100,19 @@ expect_failure 'Could not unlock-keychain'
 rm "$password_file"
 expect_failure 'exists without its password'
 reset_fixture
+fail_unlock=true
+expect_failure 'Could not unlock newly created keychain'
+! grep -q '^add-generic-password$' "$fixture/calls"
+[[ -f "$state/$name.keychain-password" ]]
+[[ -f "$home/Library/Keychains/agent-user.keychain-db" ]]
+fail_unlock=false
+prepare_keychain
+reset_fixture
 ln -s "$fixture" "$home/Library"
+expect_failure 'directory is symlinked'
+reset_fixture
+mkdir "$home/Library"
+ln -s "$fixture" "$home/Library/Preferences"
 expect_failure 'directory is symlinked'
 reset_fixture
 printf 'corrupt\n' > "$state/$name.keychain-password"

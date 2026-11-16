@@ -33,6 +33,13 @@ an error; no automatic installation occurs.
   Set the user search list to only the managed keychain. Verify default credential
   write/read routing with a temporary item and remove it before shell entry.
   This checks the native security CLI path, not every application's item ACLs.
+  Set and read the current default/search list without `-d user`; explicit-domain
+  setters use different Security APIs. Refuse writes if the resolved default
+  does not match the managed keychain path.
+  Create `~/Library/Preferences` as the target user before keychain setup:
+  Security can report successful default-setting without persisting it when
+  that directory is missing. Reproduced with a disposable native keychain:
+  absent directory yields set=0/get=1; present directory yields set=0/get=0.
 - Delete: display exact account/home; require matching typed name from the
   controlling terminal; revalidate; refuse active processes unless `--force`;
   remove account,
