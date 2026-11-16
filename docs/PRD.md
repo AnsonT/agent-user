@@ -8,10 +8,14 @@ Users need a terminal shell under a separate local macOS identity so commands
 and agents use that account's home, credentials, and filesystem permissions.
 The invoking user interacts through the same terminal and returns by exiting.
 
-V1 provides `agent-user NAME`, `agent-user --delete [--force] NAME`, and `--help`.
+V1 provides `agent-user NAME [--tmux[=SESSION]]`,
+`agent-user --delete [--force] NAME`, and `--help`.
 No agent-specific setup, command execution mode, package installation, GUI login,
-SSH configuration, automatic project sharing, sandbox policy, or session manager.
-Persistence belongs to user-installed tmux running under the target identity.
+SSH configuration, automatic project sharing, or sandbox policy.
+Optional `--tmux` uses user-installed tmux under the target identity, creating or
+attaching to `main` by default. `--tmux=SESSION` selects another session. Detaching
+returns to the invoking user while preserving the session. Missing tmux reports
+an error; no automatic installation occurs.
 
 ## Required behavior
 

@@ -6,21 +6,28 @@ export PATH
 umask 077
 
 die() { printf 'agent-user: %s\n' "$*" >&2; exit 1; }
-usage() { printf 'Usage: agent-user NAME\n       agent-user --delete [--force] NAME\n'; }
+usage() { printf 'Usage: agent-user NAME [--tmux[=SESSION]]\n       agent-user --delete [--force] NAME\n'; }
 
 action=enter
 force=false
+session=
 name=
 for argument in "$@"; do
     case "$argument" in
         -h|--help) usage; exit 0 ;;
         --delete) action=delete ;;
         --force) force=true ;;
+        --tmux) session=main ;;
+        --tmux=*) session=${argument#*=}; [[ -n "$session" ]] || die 'tmux session name cannot be empty.' ;;
         *) [[ -z "$name" ]] || { usage >&2; exit 2; }; name=$argument ;;
     esac
 done
 [[ -n "$name" ]] || { usage >&2; exit 2; }
 [[ "$force" == false || "$action" == delete ]] || die '--force requires --delete.'
+if [[ -n "$session" ]]; then
+    [[ "$action" == enter ]] || die '--tmux cannot be combined with --delete.'
+    [[ "$session" =~ ^[a-zA-Z0-9_-]+$ ]] || die 'Use letters, digits, underscores or hyphens for the tmux session name.'
+fi
 [[ "$name" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || die 'Use 1–31 lowercase letters, digits, underscores or hyphens; start with a letter.'
 [[ "$name" != root ]] || die 'The root account is protected.'
 [[ $(uname -s) == Darwin ]] || die 'macOS is required.'
@@ -31,6 +38,7 @@ if [[ $EUID != 0 ]]; then
     args=("$name")
     [[ "$action" != delete ]] || args=(--delete "$name")
     [[ "$force" == false ]] || args+=(--force)
+    [[ -z "$session" ]] || args+=("--tmux=$session")
     exec /usr/bin/sudo -- /bin/bash "$script_dir/$(basename -- "${BASH_SOURCE[0]}")" "${args[@]}"
 fi
 
@@ -228,8 +236,23 @@ prepare_keychain
 cd "$home"
 rmdir "$state/lock"
 trap - EXIT
-printf 'Entering %s. Use exit to return.\n' "$name"
+shell_args=(-l)
+if [[ -n "$session" ]]; then
+    printf 'Entering %s, tmux session %s. Detach with Ctrl-b d.\n' "$name" "$session"
+    shell_args=(-lic '
+        if ! command -v tmux >/dev/null 2>&1; then
+            export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+        fi
+        command -v tmux >/dev/null 2>&1 || {
+            printf "agent-user: tmux is not installed or accessible to this user.\n" >&2
+            exit 1
+        }
+        exec tmux new-session -A -s "$1"
+    ' agent-user "$session")
+else
+    printf 'Entering %s. Use exit to return.\n' "$name"
+fi
 exec /usr/bin/sudo -u "#$uid" -H -- /usr/bin/env -i \
     HOME="$home" USER="$name" LOGNAME="$name" SHELL=/bin/zsh \
     PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM="${TERM:-xterm-256color}" \
-    LANG="${LANG:-en_US.UTF-8}" /bin/zsh -l
+    LANG="${LANG:-en_US.UTF-8}" /bin/zsh "${shell_args[@]}"

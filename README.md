@@ -41,8 +41,11 @@ unlock password lives on the same Mac. Account deletion also removes that passwo
 If the managed keychain exists but its password is missing or no longer works,
 entry fails without replacing either file or discarding credentials.
 
-For persistence, install tmux yourself and run `tmux` inside the target shell.
-Detach, exit, re-enter with `agent-user user1`, then run `tmux attach`.
+For persistence, run `agent-user user1 --tmux` to create or attach to session
+`main`, or `agent-user user1 --tmux=work` for a named session. Detach with
+Ctrl-b then d; rerun the same command to reconnect. Sessions run as the target
+user. Install tmux yourself; the launcher checks that user's login-shell PATH
+and standard Homebrew locations. `--tmux` cannot be combined with `--delete`.
 
 Deletion displays the home path and requires typing the account name. Stop all
 processes belonging to the account, including tmux, first. Deletion removes the
